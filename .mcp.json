@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "mcp-lostfilm": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "LOSTFILM_EMAIL",
+        "-e", "LOSTFILM_PASSWORD",
+        "-e", "LOSTFILM_COOKIE",
+        "-e", "LOSTFILM_BASE_URL",
+        "-v", "mcp-lostfilm-session:/home/nobody/.mcp-lostfilm",
+        "ghcr.io/lexfrei/mcp-lostfilm:latest"
+      ],
+      "env": {
+        "LOSTFILM_EMAIL": "",
+        "LOSTFILM_PASSWORD": ""
+      }
+    }
+  }
+}
