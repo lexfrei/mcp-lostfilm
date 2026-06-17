@@ -7,6 +7,7 @@ MCP server for [LostFilm.TV](https://www.lostfilm.tv). Browse the release feed (
 ## Highlights
 
 - **Discovery without credentials.** The release feed and series search are public; the server starts and serves them with no login configured.
+- **Agent-friendly downloads.** `lostfilm_download` returns a one-time, expiring download URL (or compact metadata) instead of dumping a giant base64 blob into the model's context. The `.torrent` is held in memory and served once over an internal URL.
 - **Full resolve chain to the `.torrent`.** An episode is resolved through `v_search.php` → the intermediate redirect page → the per-quality download links, returning SD/720p/1080p/… variants with exact sizes.
 - Mirror round-robin across the known LostFilm domains, with automatic failover on network and `5xx` errors.
 - Canonical BitTorrent info-hash computed from the downloaded torrent's own bencode.
@@ -18,7 +19,7 @@ MCP server for [LostFilm.TV](https://www.lostfilm.tv). Browse the release feed (
 - **lostfilm_search** — search series and movies by title, including the full back catalogue of older shows. Returns the series id and link used by the other tools. No authentication required.
 - **lostfilm_series** — a series' metadata and full episode list (season/episode numbers, localized and original titles, episode page URLs). No authentication required.
 - **lostfilm_torrents** — resolve the available quality variants and `.torrent` download links for an episode (use `999` as the episode for a whole-season pack). Requires authentication.
-- **lostfilm_download** — download an episode's `.torrent` as base64 (ready to hand to a BitTorrent client), choosing a quality variant and enriched with the info-hash and file list; optionally saved to disk. Requires authentication.
+- **lostfilm_download** — fetch an episode's `.torrent` (choosing a quality variant), enriched with its file list, info-hash, and sha256. Pick how it is delivered with `mode`: `metadata` (info only), `base64` (inline content for piping to a torrent client), or `artifact` (a one-time, expiring download URL). The default is `artifact` when the HTTP transport is enabled, otherwise `metadata` — never a giant base64 blob unless you ask for it. Requires authentication.
 - **lostfilm_server_version** — report the server version, revision, and Go runtime.
 
 ## Authentication
@@ -49,8 +50,9 @@ Configuration is read from environment variables. No variable is required to sta
 | `LOSTFILM_BASE_URL` | Pin a single mirror (e.g. `https://www.lostfilm.today/`) | round-robin across mirrors |
 | `LOSTFILM_USER_AGENT` | Override the browser User-Agent (match the one used for `cf_clearance`) | recent Chrome |
 | `LOSTFILM_PROXY` | HTTP/SOCKS5 proxy URL | — |
-| `LOSTFILM_DOWNLOAD_DIR` | Directory for `saveToDisk` downloads | — |
-| `MCP_HTTP_PORT` | Enable the HTTP transport on this port | stdio only |
+| `LOSTFILM_ARTIFACT_BASE_URL` | Externally reachable base for artifact download URLs (e.g. `http://mcp-lostfilm.internal:9090`) | derived from the HTTP address |
+| `LOSTFILM_ARTIFACT_TTL` | How long an artifact download URL stays valid (Go duration) | `15m` |
+| `MCP_HTTP_PORT` | Enable the HTTP transport on this port (required for artifact downloads) | stdio only |
 | `MCP_HTTP_HOST` | HTTP bind host | `127.0.0.1` |
 
 ## Usage
@@ -82,7 +84,17 @@ With Claude Code, via the bundled `.mcp.json` (Docker):
 
 The bundled `.mcp.json` ships with empty `LOSTFILM_EMAIL`/`LOSTFILM_PASSWORD` values. You can leave them empty to use only the public discovery tools, fill them in, or pass a `LOSTFILM_COOKIE` instead. The named volume persists the session cookie across `--rm` container runs; drop it if you do not want persistence.
 
-The base64 returned by `lostfilm_download` is directly compatible with the `metainfo` parameter of a sibling Transmission MCP server, so a feed entry can be resolved, downloaded, and added to a torrent client in one chain.
+## Downloads
+
+`lostfilm_download` avoids putting large `.torrent` payloads into the model's context. Choose delivery with the `mode` parameter:
+
+- `metadata` — filename, size, and sha256, plus the info-hash and file list when the `.torrent` parses (no content).
+- `base64` — the above plus the inline base64 content, directly compatible with the `metainfo` parameter of a sibling Transmission MCP server.
+- `artifact` — the above plus a one-time `downloadUrl` and `expiresAt`. The `.torrent` is held in memory and served once from `GET /artifacts/{id}` on the HTTP transport, so a torrent client (or a human) can fetch it by URL. The response carries an `X-Content-Sha256` header equal to the tool's `sha256`, so a fetcher can detect a corrupted or truncated transfer — it attests the bytes the server holds, not the upstream torrent's correctness. Requires `MCP_HTTP_PORT`. See the reachability note below.
+
+The default is `artifact` when the HTTP transport is enabled, otherwise `metadata`. The download URL is an unguessable bearer capability, consumed on the first fetch attempt (a failed transfer burns it too — request a fresh download) and valid until it expires (`LOSTFILM_ARTIFACT_TTL`) — serve it only on a trusted network. The in-memory store is bounded: under an extreme burst of unfetched downloads, `artifact` mode returns an error rather than silently evicting a still-valid URL, so retry once earlier downloads are fetched or expire.
+
+By default the URL is derived from the HTTP bind address, which is `http://127.0.0.1:<port>` — reachable only from the same host. To let another host fetch it, bind a routable interface (`MCP_HTTP_HOST`) and set `LOSTFILM_ARTIFACT_BASE_URL` to the externally reachable base (e.g. `http://mcp-lostfilm.internal:9090`).
 
 ## Development
 
