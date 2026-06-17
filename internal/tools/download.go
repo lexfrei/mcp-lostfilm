@@ -2,51 +2,58 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
-	"os"
-	"path/filepath"
+	"encoding/hex"
 	"strings"
+	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/lexfrei/mcp-lostfilm/internal/artifact"
 	"github.com/lexfrei/mcp-lostfilm/internal/lostfilm"
 	"github.com/lexfrei/mcp-lostfilm/internal/torrentmeta"
 )
 
-// File permissions for a saved .torrent and its directory.
+// Download delivery modes.
 const (
-	downloadDirPerm  = 0o755
-	downloadFilePerm = 0o644
+	modeMetadata = "metadata"
+	modeBase64   = "base64"
+	modeArtifact = "artifact"
 )
 
 // DownloadParams defines the parameters for the lostfilm_download tool.
 type DownloadParams struct {
-	SeriesID   int    `json:"seriesId"             jsonschema:"Series id (from a search result or the feed)"`
-	Season     int    `json:"season"               jsonschema:"Season number"`
-	Episode    int    `json:"episode"              jsonschema:"Episode number; use 999 for a whole-season pack"`
-	Quality    string `json:"quality,omitempty"    jsonschema:"Preferred quality label (e.g. 1080p, 720p, SD, MP4); defaults to the largest available"`
-	SaveToDisk *bool  `json:"saveToDisk,omitempty" jsonschema:"Also write the .torrent to the configured download directory"`
+	SeriesID int    `json:"seriesId"          jsonschema:"Series id (from a search result or the feed)"`
+	Season   int    `json:"season"            jsonschema:"Season number"`
+	Episode  int    `json:"episode"           jsonschema:"Episode number; use 999 for a whole-season pack"`
+	Quality  string `json:"quality,omitempty" jsonschema:"Preferred quality label (e.g. 1080p, 720p, SD, MP4); defaults to the largest available"`
+	Mode     string `json:"mode,omitempty"    jsonschema:"How to deliver the .torrent: 'metadata' (info only), 'base64' (inline content for piping to a torrent client), or 'artifact' (a one-time download URL; requires the HTTP transport). Default: artifact when HTTP is enabled, otherwise metadata."`
 }
 
-// DownloadResult is the output of the lostfilm_download tool. The base64
-// content is directly compatible with the transmission_torrent_add metainfo
-// parameter of a sibling Transmission MCP server.
+// DownloadResult is the output of the lostfilm_download tool. Metadata fields
+// are always present; the content is delivered inline (base64) or via a
+// one-time download URL (artifact) depending on the mode.
 type DownloadResult struct {
-	Quality        string `json:"quality,omitempty"`
-	Filename       string `json:"filename"`
-	ContentBase64  string `json:"contentBase64"`
-	SizeBytes      int    `json:"sizeBytes"`
-	InfoHash       string `json:"infoHash,omitempty"`
-	FileCount      int    `json:"fileCount,omitempty"`
-	TotalSizeBytes int64  `json:"totalSizeBytes,omitempty"`
-	SavedPath      string `json:"savedPath,omitempty"`
+	Quality        string    `json:"quality,omitempty"`
+	Filename       string    `json:"filename"`
+	SizeBytes      int       `json:"sizeBytes"`
+	SHA256         string    `json:"sha256"`
+	InfoHash       string    `json:"infoHash,omitempty"`
+	FileCount      int       `json:"fileCount,omitempty"`
+	TotalSizeBytes int64     `json:"totalSizeBytes,omitempty"`
+	ContentBase64  string    `json:"contentBase64,omitempty"`
+	ArtifactID     string    `json:"artifactId,omitempty"`
+	DownloadURL    string    `json:"downloadUrl,omitempty"`
+	ExpiresAt      time.Time `json:"expiresAt,omitzero"`
 }
 
 // DownloadTool returns the MCP tool definition for lostfilm_download.
 func DownloadTool() *mcp.Tool {
 	return &mcp.Tool{
 		Name:        "lostfilm_download",
-		Description: "Download an episode's .torrent as base64 (ready to hand to a BitTorrent client), choosing a quality variant and enriched with the info-hash and file list; optionally save it to disk. Requires authentication",
+		Description: "Fetch an episode's .torrent (choosing a quality variant), enriched with its file list, info-hash, and sha256. Returns a one-time download URL (HTTP mode) or metadata (stdio) by default; set mode=base64 for inline content. Requires authentication",
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Download Torrent",
 			DestructiveHint: ptrBool(false),
@@ -55,15 +62,20 @@ func DownloadTool() *mcp.Tool {
 	}
 }
 
-// NewDownloadHandler creates a handler for the lostfilm_download tool. Saved
-// files are written under downloadDir when saveToDisk is requested.
-func NewDownloadHandler(client lostfilm.Client, downloadDir string) mcp.ToolHandlerFor[DownloadParams, DownloadResult] {
+// NewDownloadHandler creates a handler for the lostfilm_download tool. In
+// artifact mode the .torrent is stored and served once from artifactBaseURL.
+func NewDownloadHandler(
+	client lostfilm.Client,
+	store *artifact.Store,
+	artifactBaseURL string,
+	httpEnabled bool,
+) mcp.ToolHandlerFor[DownloadParams, DownloadResult] {
 	return func(
 		ctx context.Context,
 		_ *mcp.CallToolRequest,
 		params DownloadParams,
 	) (*mcp.CallToolResult, DownloadResult, error) {
-		result, err := runDownload(ctx, client, downloadDir, &params)
+		result, err := runDownload(ctx, client, store, artifactBaseURL, httpEnabled, &params)
 		if err != nil {
 			return &mcp.CallToolResult{IsError: true}, DownloadResult{}, err
 		}
@@ -72,11 +84,14 @@ func NewDownloadHandler(client lostfilm.Client, downloadDir string) mcp.ToolHand
 	}
 }
 
-// runDownload resolves the chosen variant, downloads it, and enriches/saves it.
+// runDownload resolves the chosen variant, downloads it, and delivers it in the
+// requested mode.
 func runDownload(
 	ctx context.Context,
 	client lostfilm.Client,
-	downloadDir string,
+	store *artifact.Store,
+	artifactBaseURL string,
+	httpEnabled bool,
 	params *DownloadParams,
 ) (DownloadResult, error) {
 	vErr := validateEpisode(params.SeriesID, params.Season, params.Episode)
@@ -84,39 +99,108 @@ func runDownload(
 		return DownloadResult{}, vErr
 	}
 
+	mode, modeErr := resolveMode(params.Mode, httpEnabled)
+	if modeErr != nil {
+		return DownloadResult{}, validationErr(modeErr)
+	}
+
+	if mode == modeArtifact && !httpEnabled {
+		return DownloadResult{}, validationErr(ErrArtifactUnavailable)
+	}
+
+	variant, file, err := resolveAndDownload(ctx, client, params)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+
+	sum := sha256.Sum256(file.Content)
+	result := DownloadResult{
+		Quality:   variant.Quality,
+		Filename:  file.Filename,
+		SizeBytes: file.SizeBytes,
+		SHA256:    hex.EncodeToString(sum[:]),
+	}
+	enrichWithMeta(&result, file.Content)
+
+	deliverErr := deliver(&result, mode, store, artifactBaseURL, file)
+	if deliverErr != nil {
+		return DownloadResult{}, deliverErr
+	}
+
+	return result, nil
+}
+
+// resolveAndDownload resolves the episode to its quality variants, picks one,
+// and downloads its .torrent.
+func resolveAndDownload(
+	ctx context.Context,
+	client lostfilm.Client,
+	params *DownloadParams,
+) (*lostfilm.TorrentVariant, *lostfilm.TorrentFile, error) {
 	variants, err := client.Torrents(ctx, params.SeriesID, params.Season, params.Episode)
 	if err != nil {
-		return DownloadResult{}, lostfilmErr("torrent resolution failed", err)
+		return nil, nil, lostfilmErr("torrent resolution failed", err)
 	}
 
 	variant := pickVariant(variants, params.Quality)
 	if variant == nil {
-		return DownloadResult{}, lostfilmErr("download failed", ErrNoVariants)
+		return nil, nil, lostfilmErr("download failed", ErrNoVariants)
 	}
 
 	file, err := client.Download(ctx, variant.DownloadURL)
 	if err != nil {
-		return DownloadResult{}, lostfilmErr("download failed", err)
+		return nil, nil, lostfilmErr("download failed", err)
 	}
 
-	result := DownloadResult{
-		Quality:       variant.Quality,
-		Filename:      file.Filename,
-		ContentBase64: base64.StdEncoding.EncodeToString(file.Content),
-		SizeBytes:     file.SizeBytes,
-	}
-	enrichWithMeta(&result, file.Content)
+	return variant, file, nil
+}
 
-	if deref(params.SaveToDisk) {
-		saved, saveErr := saveTorrent(downloadDir, file)
-		if saveErr != nil {
-			return DownloadResult{}, saveErr
+// resolveMode validates the requested mode and applies the adaptive default:
+// artifact when the HTTP transport is enabled, otherwise metadata.
+func resolveMode(raw string, httpEnabled bool) (string, error) {
+	switch raw {
+	case "":
+		if httpEnabled {
+			return modeArtifact, nil
 		}
 
-		result.SavedPath = saved
+		return modeMetadata, nil
+	case modeMetadata, modeBase64, modeArtifact:
+		return raw, nil
+	default:
+		return "", errors.Wrapf(ErrInvalidMode, "%q", raw)
+	}
+}
+
+// deliver fills the mode-specific output fields (inline base64 or a one-time
+// artifact URL); metadata mode adds nothing beyond the common fields.
+func deliver(
+	result *DownloadResult,
+	mode string,
+	store *artifact.Store,
+	artifactBaseURL string,
+	file *lostfilm.TorrentFile,
+) error {
+	switch mode {
+	case modeBase64:
+		result.ContentBase64 = base64.StdEncoding.EncodeToString(file.Content)
+	case modeArtifact:
+		art, putErr := store.Put(file.Filename, file.Content)
+		if putErr != nil {
+			return lostfilmErr("store artifact", putErr)
+		}
+
+		result.ArtifactID = art.Token
+		result.DownloadURL = artifactBaseURL + "/artifacts/" + art.Token
+		result.ExpiresAt = art.ExpiresAt
+	case modeMetadata:
+	default:
+		// Unreachable: resolveMode validates the mode first. The arm makes the
+		// invariant self-defending if a new mode is ever added.
+		return lostfilmErr("deliver", errors.Wrapf(ErrInvalidMode, "%q", mode))
 	}
 
-	return result, nil
+	return nil
 }
 
 // pickVariant selects the variant whose quality label matches the request,
@@ -165,34 +249,4 @@ func enrichWithMeta(result *DownloadResult, content []byte) {
 	result.InfoHash = meta.InfoHash
 	result.FileCount = meta.FileCount
 	result.TotalSizeBytes = meta.TotalSizeBytes
-}
-
-// saveTorrent writes the .torrent to downloadDir, sanitising the filename to a
-// base name to prevent path traversal.
-func saveTorrent(downloadDir string, file *lostfilm.TorrentFile) (string, error) {
-	if downloadDir == "" {
-		return "", validationErr(ErrNoDownloadDir)
-	}
-
-	// Reduce the server-controlled filename to a base name, then reject the
-	// dot entries explicitly so a name like ".." cannot resolve to the parent
-	// directory (relying on a later EISDIR would be fragile).
-	name := filepath.Base(file.Filename)
-	if name == "." || name == ".." {
-		name = "download.torrent"
-	}
-
-	path := filepath.Join(downloadDir, name)
-
-	mkErr := os.MkdirAll(downloadDir, downloadDirPerm)
-	if mkErr != nil {
-		return "", lostfilmErr("create download directory", mkErr)
-	}
-
-	writeErr := os.WriteFile(path, file.Content, downloadFilePerm)
-	if writeErr != nil {
-		return "", lostfilmErr("write torrent file", writeErr)
-	}
-
-	return path, nil
 }

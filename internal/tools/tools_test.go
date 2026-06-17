@@ -2,11 +2,13 @@ package tools_test
 
 import (
 	"context"
-	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
+	"github.com/lexfrei/mcp-lostfilm/internal/artifact"
 	"github.com/lexfrei/mcp-lostfilm/internal/lostfilm"
 	"github.com/lexfrei/mcp-lostfilm/internal/tools"
 )
@@ -16,10 +18,11 @@ import (
 const minimalTorrent = "d4:infod6:lengthi1024e4:name8:file.txt12:piece lengthi16384eee"
 
 const (
-	quality1080 = "1080p"
-	quality720  = "720p"
-	qualitySD   = "SD"
-	torrentName = "ep.torrent"
+	quality1080  = "1080p"
+	quality720   = "720p"
+	qualitySD    = "SD"
+	torrentName  = "ep.torrent"
+	modeArtifact = "artifact"
 )
 
 // mockClient is a configurable lostfilm.Client for handler tests.
@@ -50,6 +53,22 @@ func (m *mockClient) Torrents(_ context.Context, _, _, _ int) ([]lostfilm.Torren
 
 func (m *mockClient) Download(_ context.Context, _ string) (*lostfilm.TorrentFile, error) {
 	return m.file, m.err
+}
+
+// downloadClient returns a mock with two quality variants and a downloadable
+// .torrent, for exercising the download tool's delivery modes.
+func downloadClient() *mockClient {
+	return &mockClient{
+		variants: []lostfilm.TorrentVariant{
+			{Quality: qualitySD, SizeBytes: 100, DownloadURL: "https://n.tracktor.site/td.php?s=SD"},
+			{Quality: quality1080, SizeBytes: 900, DownloadURL: "https://n.tracktor.site/td.php?s=FHD"},
+		},
+		file: &lostfilm.TorrentFile{
+			Filename:  torrentName,
+			Content:   []byte(minimalTorrent),
+			SizeBytes: len(minimalTorrent),
+		},
+	}
 }
 
 func TestFeedHandler_Limit(t *testing.T) {
@@ -141,57 +160,101 @@ func TestTorrentsHandler_Results(t *testing.T) {
 	}
 }
 
-func TestDownloadHandler_PicksQualityAndEnriches(t *testing.T) {
+func TestDownloadHandler_MetadataDefault(t *testing.T) {
 	t.Parallel()
 
-	client := &mockClient{
-		variants: []lostfilm.TorrentVariant{
-			{Quality: qualitySD, SizeBytes: 100, DownloadURL: "https://n.tracktor.site/td.php?s=SD"},
-			{Quality: quality1080, SizeBytes: 900, DownloadURL: "https://n.tracktor.site/td.php?s=FHD"},
-		},
-		file: &lostfilm.TorrentFile{
-			Filename:  torrentName,
-			Content:   []byte(minimalTorrent),
-			SizeBytes: len(minimalTorrent),
-		},
+	// Over stdio (httpEnabled=false) the default mode is metadata: a sha256 and
+	// the enriched fields, but no inline content and no download URL.
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "", false)
+
+	_, result, err := handler(context.Background(), nil, tools.DownloadParams{SeriesID: 1, Season: 1, Episode: 1})
+	if err != nil {
+		t.Fatalf("download: %v", err)
 	}
-	handler := tools.NewDownloadHandler(client, "")
+
+	if result.SHA256 == "" || result.InfoHash == "" || result.FileCount != 1 {
+		t.Errorf("metadata incomplete: %+v", result)
+	}
+
+	if result.ContentBase64 != "" || result.DownloadURL != "" {
+		t.Errorf("metadata mode must not carry content or a URL: %+v", result)
+	}
+}
+
+func TestDownloadHandler_Base64Mode(t *testing.T) {
+	t.Parallel()
+
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "", false)
 
 	_, result, err := handler(context.Background(), nil, tools.DownloadParams{
-		SeriesID: 1, Season: 1, Episode: 1, Quality: quality1080,
+		SeriesID: 1, Season: 1, Episode: 1, Mode: "base64",
 	})
 	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
 
-	if result.Quality != quality1080 {
-		t.Errorf("quality = %q, want %q", result.Quality, quality1080)
-	}
-
 	if result.ContentBase64 == "" {
-		t.Error("expected base64 content")
+		t.Error("base64 mode must carry inline content")
 	}
 
-	if result.InfoHash == "" || result.FileCount != 1 {
-		t.Errorf("enrichment failed: hash=%q files=%d", result.InfoHash, result.FileCount)
+	if result.DownloadURL != "" {
+		t.Error("base64 mode must not carry a download URL")
 	}
 }
 
-func TestDownloadHandler_SaveRequiresDir(t *testing.T) {
+func TestDownloadHandler_ArtifactMode(t *testing.T) {
 	t.Parallel()
 
-	client := &mockClient{
-		variants: []lostfilm.TorrentVariant{{Quality: qualitySD, DownloadURL: "https://n.tracktor.site/td.php?s=SD"}},
-		file:     &lostfilm.TorrentFile{Filename: torrentName, Content: []byte(minimalTorrent)},
+	store := artifact.NewStore(time.Minute)
+	handler := tools.NewDownloadHandler(downloadClient(), store, "http://127.0.0.1:9090", true)
+
+	_, result, err := handler(context.Background(), nil, tools.DownloadParams{
+		SeriesID: 1, Season: 1, Episode: 1, Mode: modeArtifact,
+	})
+	if err != nil {
+		t.Fatalf("download: %v", err)
 	}
-	handler := tools.NewDownloadHandler(client, "")
-	save := true
+
+	if result.ArtifactID == "" || result.ExpiresAt.IsZero() {
+		t.Errorf("artifact mode must carry an id and expiry: %+v", result)
+	}
+
+	want := "http://127.0.0.1:9090/artifacts/" + result.ArtifactID
+	if result.DownloadURL != want {
+		t.Errorf("downloadUrl = %q, want %q", result.DownloadURL, want)
+	}
+
+	// The artifact must be retrievable once from the store.
+	art, ok := store.Take(result.ArtifactID)
+	if !ok || string(art.Content) != minimalTorrent {
+		t.Error("stored artifact is missing or has the wrong content")
+	}
+}
+
+func TestDownloadHandler_ArtifactRequiresHTTP(t *testing.T) {
+	t.Parallel()
+
+	// artifact mode without the HTTP transport has nowhere to serve the URL.
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "", false)
 
 	_, _, err := handler(context.Background(), nil, tools.DownloadParams{
-		SeriesID: 1, Season: 1, Episode: 1, SaveToDisk: &save,
+		SeriesID: 1, Season: 1, Episode: 1, Mode: modeArtifact,
 	})
 	if !errors.Is(err, tools.ErrValidation) {
-		t.Fatalf("expected validation error for missing download dir, got %v", err)
+		t.Fatalf("expected validation error, got %v", err)
+	}
+}
+
+func TestDownloadHandler_InvalidMode(t *testing.T) {
+	t.Parallel()
+
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "", false)
+
+	_, _, err := handler(context.Background(), nil, tools.DownloadParams{
+		SeriesID: 1, Season: 1, Episode: 1, Mode: "bogus",
+	})
+	if !errors.Is(err, tools.ErrValidation) {
+		t.Fatalf("expected validation error, got %v", err)
 	}
 }
 
@@ -207,7 +270,7 @@ func TestDownloadHandler_QualityIgnoresDescription(t *testing.T) {
 		},
 		file: &lostfilm.TorrentFile{Filename: torrentName, Content: []byte(minimalTorrent)},
 	}
-	handler := tools.NewDownloadHandler(client, "")
+	handler := tools.NewDownloadHandler(client, artifact.NewStore(time.Minute), "", false)
 
 	_, result, err := handler(context.Background(), nil, tools.DownloadParams{
 		SeriesID: 1, Season: 1, Episode: 1, Quality: quality720,
@@ -221,50 +284,20 @@ func TestDownloadHandler_QualityIgnoresDescription(t *testing.T) {
 	}
 }
 
-func TestDownloadHandler_SaveSanitizesFilename(t *testing.T) {
+func TestDownloadURLContainsArtifactsPath(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	client := &mockClient{
-		variants: []lostfilm.TorrentVariant{{Quality: qualitySD, DownloadURL: "u"}},
-		file:     &lostfilm.TorrentFile{Filename: "../../evil.torrent", Content: []byte(minimalTorrent)},
-	}
-	handler := tools.NewDownloadHandler(client, dir)
-	save := true
+	store := artifact.NewStore(time.Minute)
+	handler := tools.NewDownloadHandler(downloadClient(), store, "http://host:1/", true)
 
 	_, result, err := handler(context.Background(), nil, tools.DownloadParams{
-		SeriesID: 1, Season: 1, Episode: 1, SaveToDisk: &save,
+		SeriesID: 1, Season: 1, Episode: 1, Mode: modeArtifact,
 	})
 	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
 
-	want := filepath.Join(dir, "evil.torrent")
-	if result.SavedPath != want {
-		t.Errorf("savedPath = %q, want %q (traversal must be stripped)", result.SavedPath, want)
-	}
-}
-
-func TestDownloadHandler_SaveRejectsDotName(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	client := &mockClient{
-		variants: []lostfilm.TorrentVariant{{Quality: qualitySD, DownloadURL: "u"}},
-		file:     &lostfilm.TorrentFile{Filename: "..", Content: []byte(minimalTorrent)},
-	}
-	handler := tools.NewDownloadHandler(client, dir)
-	save := true
-
-	_, result, err := handler(context.Background(), nil, tools.DownloadParams{
-		SeriesID: 1, Season: 1, Episode: 1, SaveToDisk: &save,
-	})
-	if err != nil {
-		t.Fatalf("download: %v", err)
-	}
-
-	want := filepath.Join(dir, "download.torrent")
-	if result.SavedPath != want {
-		t.Errorf("savedPath = %q, want %q (a \"..\" name must fall back, not escape)", result.SavedPath, want)
+	if !strings.Contains(result.DownloadURL, "/artifacts/") {
+		t.Errorf("downloadUrl = %q, want it to contain /artifacts/", result.DownloadURL)
 	}
 }

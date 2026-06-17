@@ -28,9 +28,12 @@ var ErrLostfilm = errors.New("lostfilm request error")
 // ErrNoVariants indicates the requested episode resolved to no torrent variants.
 var ErrNoVariants = errors.New("no torrents found for the requested episode")
 
-// ErrNoDownloadDir is returned when saveToDisk is requested but no download
-// directory is configured.
-var ErrNoDownloadDir = errors.New("saveToDisk requires LOSTFILM_DOWNLOAD_DIR to be set")
+// ErrInvalidMode is returned when an unknown download mode is requested.
+var ErrInvalidMode = errors.New("mode must be one of: metadata, base64, artifact")
+
+// ErrArtifactUnavailable is returned when the artifact mode is requested but the
+// HTTP transport that serves download URLs is not enabled.
+var ErrArtifactUnavailable = errors.New("artifact mode requires the HTTP transport (set MCP_HTTP_PORT)")
 
 // validationErr marks an error as a validation error.
 func validationErr(err error) error {

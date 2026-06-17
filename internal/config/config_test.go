@@ -3,6 +3,7 @@ package config_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -17,9 +18,67 @@ func clearEnv(t *testing.T) {
 	for _, key := range []string{
 		"LOSTFILM_EMAIL", "LOSTFILM_PASSWORD", "LOSTFILM_COOKIE",
 		"LOSTFILM_COOKIE_FILE", "LOSTFILM_BASE_URL", "LOSTFILM_USER_AGENT",
-		"LOSTFILM_PROXY", "LOSTFILM_DOWNLOAD_DIR", "MCP_HTTP_PORT", "MCP_HTTP_HOST",
+		"LOSTFILM_PROXY", "LOSTFILM_ARTIFACT_BASE_URL", "LOSTFILM_ARTIFACT_TTL",
+		"MCP_HTTP_PORT", "MCP_HTTP_HOST",
 	} {
 		t.Setenv(key, "")
+	}
+}
+
+func TestLoad_ArtifactTTLDefault(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.ArtifactTTL != 15*time.Minute {
+		t.Errorf("ArtifactTTL = %v, want 15m", cfg.ArtifactTTL)
+	}
+}
+
+func TestLoad_ArtifactTTLInvalid(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("LOSTFILM_ARTIFACT_TTL", "nope")
+
+	_, err := config.Load()
+	if !errors.Is(err, config.ErrInvalidArtifactTTL) {
+		t.Fatalf("expected ErrInvalidArtifactTTL, got %v", err)
+	}
+}
+
+func TestArtifactBaseURLOrDefault(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("MCP_HTTP_PORT", "9090")
+	t.Setenv("MCP_HTTP_HOST", "0.0.0.0")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// A wildcard bind derives a loopback-fetchable URL, not an unusable 0.0.0.0.
+	if got := cfg.ArtifactBaseURLOrDefault(); got != "http://127.0.0.1:9090" {
+		t.Errorf("derived base = %q, want http://127.0.0.1:9090", got)
+	}
+
+	cfg.ArtifactBaseURL = "http://mcp-lostfilm.internal:9090/"
+	if got := cfg.ArtifactBaseURLOrDefault(); got != "http://mcp-lostfilm.internal:9090" {
+		t.Errorf("explicit base = %q, want trailing slash stripped", got)
+	}
+}
+
+func TestArtifactBaseURLOrDefault_StdioEmpty(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := cfg.ArtifactBaseURLOrDefault(); got != "" {
+		t.Errorf("stdio-only base = %q, want empty", got)
 	}
 }
 
