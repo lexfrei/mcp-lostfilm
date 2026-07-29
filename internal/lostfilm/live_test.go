@@ -88,7 +88,13 @@ func liveTorrents(t *testing.T, ctx context.Context, client lostfilm.Client, fee
 
 	target := pickEpisode(feed)
 	if target == nil {
+		// t.Skip ends the test through runtime.Goexit, but staticcheck does not
+		// treat it as terminating inside a helper, so it reads the lines below as
+		// reachable with target still nil and reports SA5011. The return says the
+		// same thing in a form the analyser follows.
 		t.Skip("no regular episode in the feed to resolve")
+
+		return
 	}
 
 	variants, err := client.Torrents(ctx, target.SeriesID, target.Season, target.Episode)
