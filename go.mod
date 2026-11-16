@@ -3,14 +3,14 @@ module github.com/lexfrei/mcp-lostfilm
 go 1.27.3
 
 require (
-	github.com/PuerkitoBio/goquery v1.13.0
+	github.com/PuerkitoBio/goquery v1.14.0
 	github.com/cockroachdb/errors v1.14.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	golang.org/x/sync v0.25.0
 )
 
 require (
-	github.com/andybalholm/cascadia v1.3.4 // indirect
+	github.com/andybalholm/cascadia v1.3.5 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/getsentry/sentry-go v0.46.0 // indirect
